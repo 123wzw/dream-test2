@@ -71,5 +71,26 @@ def new_opaque_token() -> str:
     return secrets.token_urlsafe(32)
 
 
+# RFC 7636 §4.1：code_verifier 由 43~128 个非保留字符组成
+_PKCE_UNRESERVED = set(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~"
+)
+
+
+def is_valid_pkce_verifier(verifier: str) -> bool:
+    return 43 <= len(verifier) <= 128 and all(c in _PKCE_UNRESERVED for c in verifier)
+
+
+def is_valid_pkce_challenge(challenge: str) -> bool:
+    # S256 与 plain 的 challenge 都是 43~128 个非保留字符（S256 固定 43）
+    return 43 <= len(challenge) <= 128 and all(c in _PKCE_UNRESERVED for c in challenge)
+
+
+def s256_challenge(verifier: str) -> str:
+    """RFC 7636 §4.2：BASE64URL-ENCODE(SHA256(ASCII(code_verifier)))。"""
+    digest = hashlib.sha256(verifier.encode("ascii")).digest()
+    return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+
+
 def new_reset_token() -> str:
     return uuid.uuid1().hex

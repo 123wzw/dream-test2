@@ -54,7 +54,9 @@ def init_db() -> None:
                 token TEXT PRIMARY KEY,
                 client_id TEXT NOT NULL,
                 user_id INTEGER NOT NULL,
-                expires_at INTEGER NOT NULL
+                expires_at INTEGER NOT NULL,
+                family TEXT NOT NULL DEFAULT '',
+                revoked INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS reset_tokens (
@@ -64,6 +66,12 @@ def init_db() -> None:
             );
             """
         )
+        # 轻量迁移：为旧库补齐刷新令牌轮换/吊销所需列（新库建表时已包含）
+        existing = {r[1] for r in conn.execute("PRAGMA table_info(refresh_tokens)")}
+        if "family" not in existing:
+            conn.execute("ALTER TABLE refresh_tokens ADD COLUMN family TEXT NOT NULL DEFAULT ''")
+        if "revoked" not in existing:
+            conn.execute("ALTER TABLE refresh_tokens ADD COLUMN revoked INTEGER NOT NULL DEFAULT 0")
         if conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
             conn.execute(
                 "INSERT INTO users (email, password_hash, display_name) VALUES (?, ?, ?)",
@@ -125,21 +133,70 @@ def get_auth_code(code: str):
         conn.close()
 
 
-def mark_code_used(code: str) -> None:
+def claim_auth_code(code: str):
+    """原子地认领授权码：仅当 code 存在且未使用时标记为已使用。
+
+    返回 (row, replay)：
+    - row 为 None 表示 code 不存在；
+    - replay 为 True 表示 code 已被使用过（重放攻击），row 仍返回原始记录，
+      供调用方吊销该授权派生出的整个令牌家族。
+    """
     conn = connect()
     try:
-        conn.execute("UPDATE auth_codes SET used = 1 WHERE code = ?", (code,))
+        row = conn.execute("SELECT * FROM auth_codes WHERE code = ?", (code,)).fetchone()
+        if row is None:
+            return None, False
+        if int(row["used"]) == 1:
+            return row, True
+        conn.execute("UPDATE auth_codes SET used = 1 WHERE code = ? AND used = 0", (code,))
+        conn.commit()
+        return row, False
+    finally:
+        conn.close()
+
+
+def save_refresh_token(token: str, client_id: str, user_id: int, family: str) -> None:
+    conn = connect()
+    try:
+        conn.execute(
+            "INSERT INTO refresh_tokens (token, client_id, user_id, expires_at, family, revoked)"
+            " VALUES (?, ?, ?, ?, ?, 0)",
+            (token, client_id, user_id, int(time.time()) + 86400 * 30, family),
+        )
         conn.commit()
     finally:
         conn.close()
 
 
-def save_refresh_token(token: str, client_id: str, user_id: int) -> None:
+def rotate_refresh_token(old_token: str, new_token: str) -> None:
+    """原子轮换：吊销旧 refresh token，并在同一家族内签发新令牌。"""
+    conn = connect()
+    try:
+        row = conn.execute(
+            "SELECT * FROM refresh_tokens WHERE token = ?", (old_token,)
+        ).fetchone()
+        if row is None:
+            return
+        conn.execute(
+            "UPDATE refresh_tokens SET revoked = 1 WHERE token = ?", (old_token,)
+        )
+        conn.execute(
+            "INSERT INTO refresh_tokens (token, client_id, user_id, expires_at, family, revoked)"
+            " VALUES (?, ?, ?, ?, ?, 0)",
+            (new_token, row["client_id"], row["user_id"],
+             int(time.time()) + 86400 * 30, row["family"]),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def revoke_refresh_family(family: str) -> None:
+    """吊销同一次授权（令牌家族）派生出的全部 refresh token。"""
     conn = connect()
     try:
         conn.execute(
-            "INSERT INTO refresh_tokens (token, client_id, user_id, expires_at) VALUES (?, ?, ?, ?)",
-            (token, client_id, user_id, int(time.time()) + 86400 * 30),
+            "UPDATE refresh_tokens SET revoked = 1 WHERE family = ?", (family,)
         )
         conn.commit()
     finally:
